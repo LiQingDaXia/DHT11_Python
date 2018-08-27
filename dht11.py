@@ -1,0 +1,238 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# modify szazo/DHT11_Python
+# to see the sound code by https://github.com/szazo/DHT11_Python
+import time
+import RPi
+import RPi.GPIO as GPIO
+import datetime
+
+wendu_channel =7 #此处修改DHT11所接IO口数值
+
+class DHT11Result:
+    'DHT11 sensor result returned by DHT11.read() method'
+
+    ERR_NO_ERROR = 0 #校验未出错标志
+    ERR_MISSING_DATA = 1 #丢失信息标志
+    ERR_CRC = 2 #校验错误标志
+
+    error_code = ERR_NO_ERROR
+    temperature = -1
+    humidity = -1
+
+    def __init__(self, error_code, temperature, humidity):
+        self.error_code = error_code
+        self.temperature = temperature
+        self.humidity = humidity
+
+    def is_valid(self):
+        return self.error_code == DHT11Result.ERR_NO_ERROR
+
+
+class DHT11:
+    'DHT11 sensor reader class for Raspberry'
+
+    __pin = 0
+
+    def __init__(self, pin):
+        self.__pin = pin
+
+    def read(self):
+        RPi.GPIO.setup(self.__pin, RPi.GPIO.OUT) #GPIO初始化为输出模式
+
+        # send initial high
+        self.__send_and_sleep(RPi.GPIO.HIGH, 0.05)#发送初始化高电平 50ms
+
+        # pull down to low
+        self.__send_and_sleep(RPi.GPIO.LOW, 0.02)#拉低至少18ms作为起始信号
+
+        # change to input using pull up
+        RPi.GPIO.setup(self.__pin, RPi.GPIO.IN, RPi.GPIO.PUD_UP)#设置为输入模式准备开始读DHT11的信号
+
+        # collect data into an array
+        data = self.__collect_input()#读到数据存入data 读取100bit
+
+        # parse lengths of all data pull up periods
+        pull_up_lengths = self.__parse_data_pull_up_lengths(data)#测出DHT返回的信号高电平持续时长（周期个数）
+
+        # if bit count mismatch, return error (4 byte data + 1 byte checksum)
+        if len(pull_up_lengths) != 40:
+            return DHT11Result(DHT11Result.ERR_MISSING_DATA, 0, 0)
+
+        # calculate bits from lengths of the pull up periods
+        bits = self.__calculate_bits(pull_up_lengths)#判断lengths[]每一位是0还是1
+
+        # we have the bits, calculate bytes
+        the_bytes = self.__bits_to_bytes(bits)
+          #每8个bit转换成1个字节 把所有字节存入 the_bytes
+
+        # calculate checksum and check
+        checksum = self.__calculate_checksum(the_bytes)#把温度个位，小数位和湿度个位，小数位加起来赋值给checksum
+          #把上边的checksum 和最后一字节校验位比较 相等即证明 数据正确 返回数值和检验标志
+        if the_bytes[4] != checksum:
+            return DHT11Result(DHT11Result.ERR_CRC, 0, 0) #未通过校验 温度湿度返回0值
+        # ok, we have valid data, return it
+        return DHT11Result(DHT11Result.ERR_NO_ERROR, the_bytes[2], the_bytes[0])#通过了校验 数据转换正确
+
+    def __send_and_sleep(self, output, sleep):
+        RPi.GPIO.output(self.__pin, output)
+        time.sleep(sleep)
+
+    def __collect_input(self):
+        # collect the data while unchanged found
+        unchanged_count = 0
+
+        # this is used to determine where is the end of the data
+        max_unchanged_count = 100
+
+        last = -1
+        data = []
+        while True:
+            current = RPi.GPIO.input(self.__pin)#IO口数据读取存入current
+            data.append(current)
+            if last != current:
+                unchanged_count = 0
+                last = current
+            else:
+                unchanged_count += 1
+                if unchanged_count > max_unchanged_count:
+                    break
+
+        return data
+
+    def __parse_data_pull_up_lengths(self, data):
+        STATE_INIT_PULL_DOWN = 1#DHT读到数据后准备开始传输数据的下拉80us
+        STATE_INIT_PULL_UP = 2#DHT读到数据后准备开始传输数据的下拉80us
+        STATE_DATA_FIRST_PULL_DOWN = 3#DHT传输的数据的第一个下拉50us
+        STATE_DATA_PULL_UP = 4#DHT传输的数据27us表示0，70us表示1
+        STATE_DATA_PULL_DOWN = 5#DHT传输数据的下拉标志50us
+
+        state = STATE_INIT_PULL_DOWN #DHT响应信号80us
+
+        lengths = [] # will contain the lengths of data pull up periods
+        current_length = 0 # will contain the length of the previous period
+
+        for i in range(len(data)):
+
+            current = data[i]
+            current_length += 1
+
+            if state == STATE_INIT_PULL_DOWN:
+                if current == RPi.GPIO.LOW:
+                    # ok, we got the initial pull down
+                    state = STATE_INIT_PULL_UP
+                    continue
+                else:
+                    continue
+            if state == STATE_INIT_PULL_UP:
+                if current == RPi.GPIO.HIGH:
+                    # ok, we got the initial pull up
+                    state = STATE_DATA_FIRST_PULL_DOWN
+                    continue
+                else:
+                    continue
+            if state == STATE_DATA_FIRST_PULL_DOWN:
+                if current == RPi.GPIO.LOW:
+                    # we have the initial pull down, the next will be the data pull up
+                    state = STATE_DATA_PULL_UP
+                    continue
+                else:
+                    continue
+
+            if state == STATE_DATA_PULL_UP:
+                if current == RPi.GPIO.HIGH:
+                    # data pulled up, the length of this pull up will determine whether it is 0 or 1
+                    current_length = 0
+                    state = STATE_DATA_PULL_DOWN
+                    continue
+                else:
+                    continue
+            if state == STATE_DATA_PULL_DOWN:
+                if current == RPi.GPIO.LOW:
+                    # pulled down, we store the length of the previous pull up period
+                    lengths.append(current_length)#current_length在高电平时给0后一直在自加 
+                    state = STATE_DATA_PULL_UP
+                    continue
+                else:
+                    continue
+          #周期长度代表高电平的时长26us长的是0 70us长的是1
+        return lengths 
+
+    def __calculate_bits(self, pull_up_lengths):
+        # find shortest and longest period
+        shortest_pull_up = 1000
+        longest_pull_up = 0
+
+        for i in range(0, len(pull_up_lengths)):
+            length = pull_up_lengths[i]
+            if length < shortest_pull_up:
+                shortest_pull_up = length
+            if length > longest_pull_up:
+                longest_pull_up = length
+
+        # use the halfway to determine whether the period it is long or short
+        halfway = shortest_pull_up + (longest_pull_up - shortest_pull_up) / 2
+        bits = []
+
+        for i in range(0, len(pull_up_lengths)):
+            bit = False
+            if pull_up_lengths[i] > halfway:
+                bit = True
+            bits.append(bit)
+
+        return bits
+
+    def __bits_to_bytes(self, bits):
+        the_bytes = []
+        byte = 0
+
+        for i in range(0, len(bits)):
+            byte = byte << 1
+            if (bits[i]):
+                byte = byte | 1
+            else:
+                byte = byte | 0
+            if ((i + 1) % 8 == 0):
+                the_bytes.append(byte)
+                byte = 0
+
+        return the_bytes
+
+    def __calculate_checksum(self, the_bytes):
+        return the_bytes[0] + the_bytes[1] + the_bytes[2] + the_bytes[3] & 255
+
+
+
+def initWenDu():
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BOARD)
+    time.sleep(0.1)
+
+def getWenDu():
+    while True:
+    	wendu = DHT11(wendu_channel)
+    	wenduResult = wendu.read()
+    	wenduzhi = wenduResult.temperature
+    	shiduzhi = wenduResult.humidity 
+    	if wenduResult.is_valid():
+            if wenduzhi and shiduzhi:
+                   break
+    #time.sleep(0.5)
+    return wenduzhi,shiduzhi 
+
+def displayWenDu():
+    #print("data is changing")
+    time.sleep(0.5)
+    wendu,shidu = getWenDu()
+    print("Last valid input: " + str(datetime.datetime.now()))
+    print("Temperature: %d C,Humidity: %d %%" %(wendu,shidu))
+    time.sleep(0.5)
+
+if __name__ == "__main__":
+    try:
+        while True:
+              initWenDu()
+              displayWenDu()
+    except KeyboardInterrupt:
+        GPIO.cleanup()
+        pass
